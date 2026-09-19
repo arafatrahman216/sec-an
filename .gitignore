@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 captures/
 *.pcap
+results/
+plots/
+venv/

@@ -30,11 +30,15 @@ server/
 attacker/
   common.py             shared safety guard, MAC resolution, IP forwarding toggle
   arp_spoof.py           Phase 2 — MITM positioning
-  tcp_hijack.py          Phase 3 — TCP session hijack
-  cookie_replay.py       Phase 4 — HTTP session hijack
+  tcp_hijack.py          Phase 3 — TCP session hijack (supports --trials, logs CSV)
+  cookie_replay.py       Phase 4 — HTTP session hijack (supports --trials, logs CSV)
   capture.py             Phase 5 — tcpdump start/stop helper
+  plot_results.py        Phase 5 — renders results/*.csv into plots/*.png
 requirements.txt
 ```
+
+`results/` (CSV evidence), `plots/` (PNG charts), and `captures/` (pcaps)
+are all generated at run time and gitignored — see [RUN.md](RUN.md).
 
 ## Phase 1 — Lab setup
 
@@ -55,77 +59,30 @@ On the **server VM**:
 
 ```bash
 pip3 install flask
-sudo python3 server/app.py --port 80              # HTTP login app
+python3 server/app.py --port 8080                 # HTTP login app (no root needed above port 1024)
 python3 server/telnet_service.py --port 2323       # plaintext TCP service
 ```
+`app.py` defaults to `--port 80`, which requires root (and, if you're in a
+venv, `sudo` won't see packages installed only inside it — see the
+troubleshooting note below). Using `--port 8080` sidesteps both problems;
+the design and the attack are identical either way, just point the client
+and `cookie_replay.py --port` at 8080 instead of 80.
 
-On the **client VM**: nothing to install beyond a browser/curl and a telnet
-client (`sudo apt install telnet`).
+> **`sudo: ModuleNotFoundError: No module named 'flask'`?** `sudo` resets
+> your shell environment, so it runs the *system* Python, not your venv's.
+> Either run `sudo ./venv/bin/python3 server/app.py --port 80` (points sudo
+> at the venv interpreter directly), or just use `--port 8080` and skip
+> `sudo` entirely — recommended for this lab.
+
+On the **client VM**: nothing to install beyond curl and netcat
+(`sudo apt install curl netcat-openbsd`).
 
 ## Run order
 
-Use a separate terminal per script; everything attacker-side stays running
-in the foreground so you can watch the logs.
-
-**1. Server VM**
-```bash
-sudo python3 server/app.py --port 80
-python3 server/telnet_service.py --port 2323   # separate terminal
-```
-
-**2. Attacker VM — baseline capture (no attack yet)**
-```bash
-python3 attacker/capture.py start --name baseline --iface eth1 \
-  --hosts 192.168.56.10 192.168.56.20
-```
-
-**3. Client VM — normal session**
-```bash
-curl -c cookies.txt -d "username=alice&password=password123" http://192.168.56.20/login
-curl -b cookies.txt http://192.168.56.20/account
-telnet 192.168.56.20 2323     # send a couple of plain commands, leave open
-```
-
-**4. Attacker VM — stop baseline, start attack capture**
-```bash
-python3 attacker/capture.py stop --name baseline
-python3 attacker/capture.py start --name attack --iface eth1 \
-  --hosts 192.168.56.10 192.168.56.20
-```
-
-**5. Attacker VM — MITM positioning (Phase 2)**
-```bash
-sudo python3 attacker/arp_spoof.py --client 192.168.56.10 \
-  --server 192.168.56.20 --iface eth1
-```
-Leave this running. Check `arp -n` on the client and server — both should
-now show the attacker's MAC for the other host.
-
-**6. Client VM — keep the telnet session open and type something**, so
-there's live traffic for the next script to read.
-
-**7. Attacker VM — TCP hijack (Phase 3, new terminal)**
-```bash
-sudo python3 attacker/tcp_hijack.py --client 192.168.56.10 \
-  --server 192.168.56.20 --port 2323 --iface eth1 \
-  --payload "id" [--send-rst]
-```
-
-**8. Client VM — log in again over HTTP** (or reuse step 3) so the cookie
-crosses the wire while the attacker is on-path.
-
-**9. Attacker VM — HTTP hijack (Phase 4, new terminal)**
-```bash
-sudo python3 attacker/cookie_replay.py --client 192.168.56.10 \
-  --server 192.168.56.20 --port 80 --iface eth1
-```
-
-**10. Attacker VM — stop attack capture, Ctrl-C the ARP spoofer**
-```bash
-python3 attacker/capture.py stop --name attack
-# Ctrl-C in the arp_spoof.py terminal — it restores real ARP mappings
-# and disables IP forwarding automatically.
-```
+See **[RUN.md](RUN.md)** for the exact, copy-pasteable command sequence
+across all three VMs — including running each hijack multiple times
+(`--trials`) so `results/*.csv` and `plots/*.png` come out ready to drop
+into the report.
 
 ## What to screenshot (Design Report Section 5 — Expected Outcome)
 
@@ -144,6 +101,12 @@ Open `captures/attack.pcap` in Wireshark for all of these:
    `cookie_replay.py`'s output (HTTP 200 with the protected page, sourced
    from the attacker's IP, no credentials sent), plus the `Cookie:` /
    `Set-Cookie:` header pair in `captures/baseline.pcap` or `attack.pcap`.
+
+Also include the quantitative evidence from a `--trials` run (see
+[RUN.md](RUN.md)): `results/tcp_hijack_results.csv`,
+`results/cookie_replay_results.csv`, and the five charts in `plots/`
+(injection outcome counts, live SEQ progression, injection/replay latency,
+and cookie-replay success rate).
 
 ## Defenses (Design Report Section 6) — not implemented here on purpose
 
